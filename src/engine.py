@@ -10,7 +10,6 @@ class GenerationEngine:
     def __init__(self, model_name: str = "Qwen/Qwen3-0.6B") -> None:
         self.model_name = model_name
 
-
     def generate_call(self, prompt: str, functions: List[FunctionDef]) -> str:
         """
         1. Encode the prompt into Input IDs.
