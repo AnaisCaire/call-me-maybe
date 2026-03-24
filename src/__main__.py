@@ -26,7 +26,7 @@ def main():
                         help='the file where we test with prompts')
     parser.add_argument('-o',
                         '--output',
-                        default='data/input/function_calling_results.json',
+                        default='data/output/function_calling_results.json',
                         type=Path,
                         help='the file where we will see the output')
 
@@ -36,39 +36,31 @@ def main():
     parser_instance = Parsing(arg.functions_definition)
     functions = parser_instance.load_def()
 
-    # Step 2: Load Test Prompts (Mandatory V.2)
+    # Step 2: Load Test Prompts
     with open(arg.input, 'r') as f:
-        test_data = json.load(f)  # test_data is a list of {"prompt": "..."}
+        test_data = json.load(f)
     generate = GenerationEngine(functions=functions)
     results = []
-
     # Step 3: Loop through prompts
     for entry in test_data:
         user_prompt = entry["prompt"]
-
-        # Pass the specific prompt to the engine
-        # Note: we add '{"' in the engine's build_prompt to kickstart JSON
-        json_call_str = generate.generate_call(user_prompt)
-        breakpoint()
+        generate.generate_call(user_prompt)
+        print(f"DEBUG: {repr(generate.constraint_engine.generated_so_far)}")
         # The result must be valid JSON to be stored in the list
         try:
-            # We prefix with the '{' we manually added in the prompt
-            call_data = json.loads("{" + json_call_str)
-            
-            # Construct the final object as per V.4 requirements
+            call_data = json.loads(generate.constraint_engine.generated_so_far)
             results.append({
                 "prompt": user_prompt,
                 "name": call_data.get("name"),
                 "parameters": call_data.get("parameters")
             })
         except json.JSONDecodeError:
-            print(f"Error: Model produced invalid JSON for prompt: {user_prompt}")
+            print("Error: Model produced invalid JSON for prompt:",
+                  user_prompt)
 
     # Step 4: Write the single output file (Mandatory V.4)
     with open(arg.output, 'w') as f:
         json.dump(results, f, indent=2)
-    pdb.set_trace()
-    breakpoint()
 
 
 if __name__ == "__main__":

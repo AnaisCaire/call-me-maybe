@@ -1,234 +1,338 @@
 from llm_sdk import Small_LLM_Model
 from src.parser import FunctionDef
-from typing import List, Any, Optional, Set
+from typing import List, Optional
 import json
 from enum import Enum, auto
-import numpy as np, pdb
+import numpy as np
 
 
 class GenState(Enum):
     """Tracks where we are in the JSON structure being generated."""
-    FUNC_NAME = auto()  # generating the value of "name"
-    AFTER_NAME = auto()  # generating the literal: ", "parameters": {"
-    PARAM_KEY = auto()  # generating a parameter key
+    FUNC_NAME = auto()    # generating the value of "name"
+    AFTER_NAME = auto()   # generating the literal: ", "parameters": {"
+    PARAM_KEY = auto()    # generating a parameter key (with its quotes)
+    AFTER_PARAM = auto()  # generating the literal ": "
     PARAM_VALUE = auto()  # generating a parameter value
-    DONE = auto()  # closing brace written — stop
+    CLOSING = auto()      # writing the two closing braces "}}"
+    DONE = auto()         # generation complete — stop
 
 
 class ConstraintEngine:
-    def __init__(self,
-                 functions: List[FunctionDef],
-                 vocab: dict[int, str],
-                 model_vocab_size: int) -> None:
+    """
+    Token-aware constraint engine.
+
+    At each generation step it produces a float32 mask of shape (vocab_size,):
+      0.0  → token is valid at this position
+     -1e9  → token is forbidden (will be masked out by biased argmax)
+    """
+
+    def __init__(
+        self,
+        functions: List[FunctionDef],
+        vocab: dict,           # {token_id (int): raw_token_str}
+        model_vocab_size: int,
+    ) -> None:
         self.functions = functions
-        self.vocab = vocab
         self.vocab_size = model_vocab_size
-        
-        # Pre-calculate categories for O(1) masking 
-        self._token_clean_map = {tid: s.replace("Ġ", " ") for tid, s in vocab.items()}
-        
-        self.quote_tokens = [tid for tid, s in self._token_clean_map.items() if s == '"']
-        self.comma_tokens = [tid for tid, s in self._token_clean_map.items() if s.strip() == ","]
-        self.brace_tokens = [tid for tid, s in self._token_clean_map.items() if s.strip() == "}"]
-        
-        # Pre-filter numeric tokens [cite: 316]
-        self.numeric_tokens = [
-            tid for tid, s in self._token_clean_map.items() 
-            if all(c in "0123456789.-" for c in s) and len(s) > 0
+
+        # Normalise the special BPE space character once, store clean strings.
+        # Used for fragment matching (function names, parameter keys).
+        self._token_clean_map: dict[int, str] = {
+            tid: s.replace("\u0120", " ")   # Ġ → space
+            for tid, s in vocab.items()
+        }
+
+        # Pre-compute token-id sets for single characters we mask on/off.
+        # Use the RAW vocab with endswith() — Qwen BPE may store punctuation
+        # with a prefix byte (e.g. Ġ}, Ċ}) that survives after Ġ→space
+        # normalisation only for the space character.  endswith() is the only
+        # safe way to match '}', '"', and ',' regardless of prefix encoding.
+        self.quote_tokens: List[int] = [
+            tid for tid, s in vocab.items() if s.endswith('"')
+        ]
+        self.comma_tokens: List[int] = [
+            tid for tid, s in vocab.items() if s.endswith(",")
+        ]
+        self.brace_close_tokens: List[int] = [
+            tid for tid, s in vocab.items() if s.endswith("}")
+        ]
+        self.numeric_tokens: List[int] = [
+            tid for tid, s in self._token_clean_map.items()
+            if len(s) > 0 and all(c in "0123456789.-" for c in s)
         ]
 
         self.reset()
 
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
     def get_valid_mask(self) -> np.ndarray:
-        mask = np.zeros(self.vocab_size, dtype=np.float32)
+        """Return the additive logit mask for the current generation state."""
+        # All tokens start forbidden; we open up only the valid ones.
+        mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
 
         if self.state == GenState.FUNC_NAME:
+            # Allow any token that extends the current fragment toward a
+            # known function name, plus the closing quote once the full
+            # name has been written.
             fragment = self.generated_so_far.split('{"name": "')[-1]
-            # Optimization: Only loop through known functions, not full vocab
-            for f in self.functions:
-                if f.name.startswith(fragment):
-                    # We need the token that matches the next part of f.name
-                    remaining = f.name[len(fragment):]
-                    # This still requires some lookup, but only for specific tokens
-                    # A better way is to pre-map which tokens start with which strings.
-            # Simplified for speed:
             for tid, s in self._token_clean_map.items():
                 if any(f.name.startswith(fragment + s) for f in self.functions):
-                    mask[tid] = 1.0
+                    mask[tid] = 0.0
                 if s == '"' and any(f.name == fragment for f in self.functions):
-                    mask[tid] = 1.0
+                    mask[tid] = 0.0
 
         elif self.state == GenState.AFTER_NAME:
-            target = '", "parameters": {"'
-            suffix = self.generated_so_far.split(self.selected_function.name)[-1]
-            remaining = target[len(suffix):]
+            # Force the exact literal: ", "parameters": {
+            # Note: no trailing quote — PARAM_KEY owns the first key's opening quote.
+            target = '", "parameters": {'
+            already = self.generated_so_far.split(self.selected_function.name)[-1]
+            remaining = target[len(already):]
             for tid, s in self._token_clean_map.items():
                 if remaining.startswith(s) and len(s) > 0:
-                    mask[tid] = 1.0
+                    mask[tid] = 0.0
 
         elif self.state == GenState.PARAM_KEY:
-            # Logic similar to FUNC_NAME but for keys [cite: 300]
-            last_part = self.generated_so_far.split('{')[-1].split(',')[-1].strip()
-            fragment = last_part.replace('"', '') if '"' in last_part else ""
-            
+            if not self.in_key_body:
+                # FIX (Bug 1): entering PARAM_KEY means we need the opening
+                # quote first. Force it unconditionally.
+                for tid in self.quote_tokens:
+                    mask[tid] = 0.0
+            else:
+                # Opening quote already written — allow tokens that extend
+                # the fragment toward an unfilled parameter name, plus the
+                # closing quote once the full name matches.
+                fragment = self.generated_so_far.split('"')[-1]
+                remaining_keys = [
+                    p for p in self.selected_function.parameters
+                    if p not in self.filled_params
+                ]
+                for tid, s in self._token_clean_map.items():
+                    if any(p.startswith(fragment + s) for p in remaining_keys):
+                        mask[tid] = 0.0
+                    if s == '"' and any(p == fragment for p in remaining_keys):
+                        mask[tid] = 0.0
+
+        elif self.state == GenState.AFTER_PARAM:
+            # Force the literal ": " after the closing quote of the key.
+            target = ": "
+            already = self.generated_so_far.split('"')[-1]
+            remaining = target[len(already):]
             for tid, s in self._token_clean_map.items():
-                if any(p.startswith(fragment + s) for p in self.selected_function.parameters 
-                       if p not in self.filled_params):
-                    mask[tid] = 1.0
-                if s == '"' and any(p == fragment for p in self.selected_function.parameters 
-                                   if p not in self.filled_params):
-                    mask[tid] = 1.0
+                if remaining.startswith(s) and len(s) > 0:
+                    mask[tid] = 0.0
 
         elif self.state == GenState.PARAM_VALUE:
             param_def = self.selected_function.parameters[self.current_param]
-            if param_def.type == 'string':
+            remaining_params = [
+                p for p in self.selected_function.parameters
+                if p not in self.filled_params
+            ]
+            more_params_follow = len(remaining_params) > 0
+
+            if param_def.type == "string":
                 if not self.in_string_value:
-                    mask[self.quote_tokens] = 1.0
+                    # Need the opening quote.
+                    for tid in self.quote_tokens:
+                        mask[tid] = 0.0
                 else:
-                    mask[:] = 1.0 # Allow all inside string, logic in update_state closes it
-            elif param_def.type == 'number':
-                mask[self.numeric_tokens] = 1.0
-                mask[self.comma_tokens] = 1.0
-                mask[self.brace_tokens] = 1.0
+                    # Inside a string: allow any token except closing brace.
+                    mask[:] = 0.0
+                    for tid in self.brace_close_tokens:
+                        mask[tid] = -1e9
+                    # The closing quote ends the string value; it is handled
+                    # in update_state. We allow it here by leaving mask[quote]=0.
+
+            elif param_def.type == "number":
+                # Allow numeric tokens to build the number.
+                for tid in self.numeric_tokens:
+                    mask[tid] = 0.0
+                # Non-last param: terminate with ',' to move to next key.
+                # Last param: terminate with '}' which closes the parameters
+                # object; CLOSING then writes the outer '}'.
+                if more_params_follow:
+                    for tid in self.comma_tokens:
+                        mask[tid] = 0.0
+                else:
+                    for tid in self.brace_close_tokens:
+                        mask[tid] = 0.0
+
+        elif self.state == GenState.CLOSING:
+            # String params arrive here with closing_first_done=False (need inner brace).
+            # Number params arrive with closing_first_done=True (inner brace already written).
+            # Either way, force the next '}' unconditionally.
+            for tid in self.brace_close_tokens:
+                mask[tid] = 0.0
 
         return mask
 
     def update_state(self, token_id: int) -> None:
+        """Advance the DFA by one generated token."""
         token_str = self._token_clean_map.get(token_id, "")
         self.generated_so_far += token_str
-        
-        # State transitions [cite: 271, 284]
-        if self.state == GenState.FUNC_NAME and token_str == '"':
-            name = self.generated_so_far.split('{"name": "')[-1][:-1]
-            self.selected_function = next(f for f in self.functions if f.name == name)
-            self.state = GenState.AFTER_NAME
-            
+
+        if self.state == GenState.FUNC_NAME:
+            if token_str.endswith('"'):
+                # The name value is complete.
+                name = self.generated_so_far.split('{"name": "')[-1][:-1]
+                self.selected_function = next(
+                    f for f in self.functions if f.name == name
+                )
+                self.state = GenState.AFTER_NAME
+
         elif self.state == GenState.AFTER_NAME:
-            if self.generated_so_far.endswith('", "parameters": {"'):
+            if self.generated_so_far.endswith('", "parameters": {'):
                 self.state = GenState.PARAM_KEY
-                
-        elif self.state == GenState.PARAM_KEY and token_str == '"':
-            # Extract key between last { or , and current "
-            parts = self.generated_so_far.replace(' ', '').split('"')
-            self.current_param = parts[-2]
-            self.filled_params.add(self.current_param)
-            self.state = GenState.PARAM_VALUE
-            
+                self.in_key_body = False
+
+        elif self.state == GenState.PARAM_KEY:
+            if token_str.endswith('"'):
+                if not self.in_key_body:
+                    # Opening quote consumed — now inside the key body.
+                    self.in_key_body = True
+                else:
+                    # Closing quote consumed — key is complete.
+                    self.in_key_body = False
+                    self.current_param = self.generated_so_far.split('"')[-2]
+                    self.filled_params.add(self.current_param)
+                    self.state = GenState.AFTER_PARAM
+
+        elif self.state == GenState.AFTER_PARAM:
+            if self.generated_so_far.endswith(": "):
+                self.state = GenState.PARAM_VALUE
+
         elif self.state == GenState.PARAM_VALUE:
             p_type = self.selected_function.parameters[self.current_param].type
-            if p_type == 'string':
-                if token_str == '"':
-                    self.in_string_value = not self.in_string_value
-                    if not self.in_string_value: # Just closed the string
-                        self._transition_from_value()
-            elif p_type == 'number':
-                if token_str in [',', '}', ', ', '} ']:
-                    self._transition_from_value()
 
-    def _transition_from_value(self) -> None:
-        if len(self.filled_params) == len(self.selected_function.parameters):
-            self.state = GenState.DONE
-        else:
-            self.state = GenState.PARAM_KEY
+            if p_type == "string":
+                if token_str.endswith('"'):
+                    self.in_string_value = not self.in_string_value
+                    if not self.in_string_value:
+                        # Closing quote of string value seen.
+                        self._transition_after_value()
+
+            elif p_type == "number":
+                if token_str.endswith(","):
+                    self._transition_after_value()
+                elif token_str.endswith("}"):
+                    # Last number param: '}' closes the parameters object.
+                    self.closing_first_done = True
+                    self.state = GenState.CLOSING
+
+        elif self.state == GenState.CLOSING:
+            if token_str.endswith("}"):
+                if not self.closing_first_done:
+                    self.closing_first_done = True  # first brace written
+                else:
+                    self.state = GenState.DONE       # second brace written
 
     def is_complete(self) -> bool:
+        """Return True when both closing braces have been written."""
         return self.state == GenState.DONE
 
     def reset(self) -> None:
-        self.generated_so_far = '{"name": "'
-        self.state = GenState.FUNC_NAME
-        self.selected_function = None
-        self.current_param = None
-        self.filled_params = set()
-        self.in_string_value = False
+        """Reset all mutable state for a fresh generation run."""
+        self.generated_so_far: str = '{"name": "'
+        self.state: GenState = GenState.FUNC_NAME
+        self.selected_function: Optional[FunctionDef] = None
+        self.current_param: Optional[str] = None
+        self.filled_params: set = set()
+        self.in_key_body: bool = False
+        self.in_string_value: bool = False
+        self.closing_first_done: bool = False  # tracks which of '}}' we're on
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _transition_after_value(self) -> None:
+        """Move to the next state after a parameter value is complete."""
+        remaining = [
+            p for p in self.selected_function.parameters
+            if p not in self.filled_params
+        ]
+        if remaining:
+            self.state = GenState.PARAM_KEY
+            self.in_key_body = False   # opening quote not yet written
+        else:
+            # All parameters filled — need to close the parameters object.
+            self.state = GenState.CLOSING
 
 
 class GenerationEngine:
     """
-    Handles interaction with the LLM and the generation process.
+    Handles prompt construction and the token-by-token generation loop.
     """
-    def __init__(self, functions: List[FunctionDef], model_name: str = "Qwen/Qwen3-0.6B") -> None:
+
+    def __init__(
+        self,
+        functions: List[FunctionDef],
+        model_name: str = "Qwen/Qwen3-0.6B",
+    ) -> None:
         self.model_name = model_name
         self.functions = functions
         self.model = Small_LLM_Model(model_name)
+
+        # Load and invert the vocabulary: raw string → token id → clean string.
         vocab_path = self.model.get_path_to_vocab_file()
-        with open(vocab_path, 'r') as f:
-            original_dict = json.load(f)
-        invert_vocab = {value: key for key, value in original_dict.items()}
-        # --- NEW: Define model_vocab_size by probing the SDK  ---
-        # 1. Create a tiny dummy sequence
-        dummy_input = self.model.encode(" ") # Returns Tensor 
-        dummy_ids = dummy_input[0].tolist() 
+        with open(vocab_path, "r") as f:
+            raw_vocab: dict = json.load(f)
+        # raw_vocab is {token_str: token_id}; we need {token_id: token_str}.
+        inverted: dict[int, str] = {v: k for k, v in raw_vocab.items()}
 
-        # 2. Get one set of logits from the model 
-        dummy_logits = self.model.get_logits_from_input_ids(dummy_ids)
-        # 3. THIS is your defined size (e.g., 151936)
-        model_vocab_size = len(dummy_logits)
-        self.constraint_engine = ConstraintEngine(functions, invert_vocab, model_vocab_size)
+        # Probe the actual vocabulary size from one forward pass.
+        dummy_ids = self.model.encode(" ")[0].tolist()
+        model_vocab_size = len(self.model.get_logits_from_input_ids(dummy_ids))
 
-    def _build_prompt(self, user_request: str, functions: List[FunctionDef]) -> str:
-        """
-        Assembles the ChatML prompt to guide the LLM toward function selection.
-        References: Chapter V.3.2 (The Generation Pipeline).
-        """
-        # Convert Pydantic objects to a clean list of dicts for the prompt
-        func_list = [f.model_dump() for f in functions]
-        functions_json = json.dumps(func_list, indent=2)
-
-        # System Instructions: Clear, concise, and professional
-        system_message = (
-            "You are a helpful assistant that translates natural language into "
-            "JSON function calls. Use only the provided functions."
+        self.constraint_engine = ConstraintEngine(
+            functions, inverted, model_vocab_size
         )
 
-        # Assemble ChatML (Mandatory format for Qwen/Qwen3)
-        # We append '{"name": "' to force the model to follow the required schema 
-        # from the very first character of the assistant response.
-        prompt = (
+    def _build_prompt(
+        self, user_request: str, functions: List[FunctionDef]
+    ) -> str:
+        """
+        Assemble the ChatML prompt for Qwen3.
+
+        The assistant turn is pre-filled with '{"name": "' so the very
+        first constrained token is already the start of the function name.
+        """
+        func_list = [f.model_dump() for f in functions]
+        functions_json = json.dumps(func_list, indent=2)
+        system_message = (
+            "You are a helpful assistant that translates natural language "
+            "into JSON function calls. Use only the provided functions."
+        )
+        return (
             f"<|im_start|>system\n{system_message}\n"
             f"Available functions:\n{functions_json}<|im_end|>\n"
             f"<|im_start|>user\n{user_request}<|im_end|>\n"
-            f"<|im_start|>assistant\n{{\"name\": \""
+            f'<|im_start|>assistant\n{{"name": "'
         )
-        return prompt
 
     def generate_call(self, prompt_text: str) -> str:
         """
-        Implements the generation pipeline described in V.3.2.
-        """
-        full_prompt_string = self._build_prompt(prompt_text, self.functions)
-        # 1. SDK encode returns a Tensor (usually shape [1, seq_len])
-        input_ids_tensor = self.model.encode(full_prompt_string)
+        Run the constrained token-by-token generation loop.
 
-        # Convert to a flat Python list for easy appending (logic outside SDK)
-        # The SDK's encode gives a 2D tensor, so we take the first row
-        current_sequence = input_ids_tensor[0].tolist()
-        generated_ids: List[int] = []
+        Returns the raw generated JSON string (starting from '{"name": "').
+        """
+        full_prompt = self._build_prompt(prompt_text, self.functions)
+        input_ids: List[int] = self.model.encode(full_prompt)[0].tolist()
         self.constraint_engine.reset()
 
         while not self.constraint_engine.is_complete():
-            # V.3.1: get_logits_from_input_ids requires a list of ints
-            logits_list = self.model.get_logits_from_input_ids(current_sequence)
-            logits_array = np.array(logits_list, dtype=np.float32)
-            
-            # Get your validity mask (0.0 or 1.0)
+            logits = np.array(
+                self.model.get_logits_from_input_ids(input_ids),
+                dtype=np.float32,
+            )
             mask = self.constraint_engine.get_valid_mask()
-            
-            # Apply the bias (Negative Infinity for invalid tokens)
-            # Requirement V.3.3: constrained decoding interventions
-            biased_logits = logits_array + (mask - 1.0) * 1e9
-            
-            # Greedy selection (Chapter V.3.2 step 6)
-            next_token_id = int(np.argmax(biased_logits))
-            
-            # Update sequence for next LLM pass and update the DFA state
-            current_sequence.append(next_token_id)
-            generated_ids.append(next_token_id)
+            next_token_id = int(np.argmax(logits + mask))
+            input_ids.append(next_token_id)
             self.constraint_engine.update_state(next_token_id)
-            
-            # Safety break to avoid infinite loops (optional but recommended)
-            if len(generated_ids) > 512:
-                break
-            
-        return self.model.decode(generated_ids)
 
+            # Safety valve: prevent infinite loops on unexpected model behaviour.
+            if len(input_ids) > 512:
+                break
+
+        return self.constraint_engine.generated_so_far
