@@ -1,9 +1,39 @@
-from llm_sdk import Small_LLM_Model
 from src.parser import FunctionDef
-from typing import List, Optional
-import json
+from typing import List, Set
 from enum import Enum, auto
+from pydantic import BaseModel
 import numpy as np
+
+
+class NumericConstraint(BaseModel):
+    """
+    Context-aware numeric token validator.
+    Separates 'discovery' (which chars are allowed) from 'validation'
+    (is this token valid given what's already been generated?).
+    """
+    allowed_chars: Set[str] = set("0123456789.-")
+
+    def get_valid_continuation_tokens(self, current_buffer: str, vocab: dict) -> List[int]:
+        """Returns token IDs that keep current_buffer + token a valid partial JSON number."""
+        return [tid for tid, s in vocab.items() if self._is_valid_continuation(current_buffer, s)]
+
+    def _is_valid_continuation(self, buffer: str, token: str) -> bool:
+        if not token:
+            return False
+        candidate = buffer + token
+        # All characters must be numeric-safe
+        if not all(c in self.allowed_chars for c in candidate):
+            return False
+        # Must start with a digit or '-', never '.'
+        if candidate[0] not in "-0123456789":
+            return False
+        # '-' only allowed at position 0
+        if "-" in candidate[1:]:
+            return False
+        # At most one decimal point
+        if candidate.count(".") > 1:
+            return False
+        return True
 
 
 class GenState(Enum):
@@ -39,7 +69,7 @@ class ConstraintEngine:
         }
 
         # --- PRE-COMPUTED NUMPY MASKS (O(1) Speed - V.5) ---
-        
+
         self.quote_tokens = np.array([
             tid for tid, s in self._token_clean_map.items() if s.strip() == '"'
         ], dtype=np.int32)
@@ -67,11 +97,7 @@ class ConstraintEngine:
                     safe_comma.append(tid)
         self.safe_comma_closers = np.array(safe_comma, dtype=np.int32)
 
-        # Strict Numbers
-        self.numeric_tokens = np.array([
-            tid for tid, s in self._token_clean_map.items()
-            if len(s) > 0 and all(c in " 0123456789.-" for c in s)
-        ], dtype=np.int32)
+        self.numeric_constraint = NumericConstraint()
 
         self.strict_comma_tokens = np.array([
             tid for tid, s in self._token_clean_map.items() if s.strip() in [",", ", "]
@@ -140,7 +166,11 @@ class ConstraintEngine:
                         mask[self.safe_brace_closers] = 0.0
 
             elif param_def.type == "number":
-                mask[self.numeric_tokens] = 0.0
+                number_buffer = self.generated_so_far.split(": ")[-1]
+                valid_num_ids = self.numeric_constraint.get_valid_continuation_tokens(
+                    number_buffer, self._token_clean_map
+                )
+                mask[valid_num_ids] = 0.0
                 if more_params_follow:
                     mask[self.strict_comma_tokens] = 0.0
                 else:
@@ -154,8 +184,8 @@ class ConstraintEngine:
                     already = target[:i]
                     break
             remaining = target[len(already):]
-            
-            if remaining == "": 
+
+            if remaining == "":
                 mask[self.quote_tokens] = 0.0
             else:
                 for tid, s in self._token_clean_map.items():
@@ -199,18 +229,18 @@ class ConstraintEngine:
 
         elif self.state == GenState.PARAM_VALUE:
             p_type = self.selected_function.parameters[self.current_param].type
-            
+
             if p_type == "string":
                 quote_count = token_str.count('"')
                 if quote_count > 0:
                     # Toggle state if an odd number of quotes is found
                     if quote_count % 2 == 1:
                         self.in_string_value = not self.in_string_value
-                    
+
                     # If we just closed the string, transition!
                     if not self.in_string_value:
                         self._transition_after_value()
-                        
+
                         # BPE CATCH: Check if a closing brace sneaked in with the quote
                         if self.state == GenState.CLOSING and "}" in token_str:
                             after_quote = token_str.split('"')[-1]
@@ -221,7 +251,7 @@ class ConstraintEngine:
                                 self.closing_first_done = True
 
             elif p_type == "number":
-                if "," in token_str: 
+                if "," in token_str:
                     self._transition_after_value()
                 elif "}" in token_str:
                     self.closing_first_done = True
@@ -268,57 +298,3 @@ class ConstraintEngine:
         self.in_key_body = False
         self.in_string_value = False
         self.closing_first_done = False
-
-
-class GenerationEngine:
-    """Interacts with the LLM SDK."""
-    def __init__(self, functions: List[FunctionDef], model_name: str = "Qwen/Qwen3-0.6B") -> None:
-        self.model = Small_LLM_Model(model_name)
-        self.functions = functions
-        
-        vocab_path = self.model.get_path_to_vocab_file()
-        with open(vocab_path, "r") as f:
-            raw_vocab = json.load(f)
-        inverted = {v: k for k, v in raw_vocab.items()}
-        
-        # Determine actual logit size (Requirement V.3.1)
-        dummy_ids = self.model.encode(" ")[0].tolist()
-        model_vocab_size = len(self.model.get_logits_from_input_ids(dummy_ids))
-        
-        self.constraint_engine = ConstraintEngine(functions, inverted, model_vocab_size)
-
-    def generate_call(self, prompt_text: str) -> str:
-        """Runs the generation loop (Requirement V.3.2)."""
-        system_message = "You are a helpful assistant that translates natural language into JSON function calls. Use only the provided functions."
-        func_json = json.dumps([f.model_dump() for f in self.functions], indent=2)
-        
-        full_prompt = (
-            f"<|im_start|>system\n{system_message}\n"
-            f"Available functions:\n{func_json}<|im_end|>\n"
-            f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
-            f'<|im_start|>assistant\n{{"name": "'
-        )
-
-        input_ids = self.model.encode(full_prompt)[0].tolist()
-        self.constraint_engine.reset()
-
-        while not self.constraint_engine.is_complete():
-            logits = np.array(self.model.get_logits_from_input_ids(input_ids), dtype=np.float32)
-            mask = self.constraint_engine.get_valid_mask()
-
-            # Requirement V.3.3: Intervention via logit bias
-            next_token_id = int(np.argmax(logits + mask))
-            input_ids.append(next_token_id)
-
-            # Update state machine based on token choice
-            self.constraint_engine.update_state(next_token_id)
-
-            # IMMEDIATE EXIT: Chop off the generation exactly when done to prevent garbage
-            if self.constraint_engine.is_complete():
-                break
-
-            # Safety Limit
-            if len(input_ids) > 2048:
-                break
-
-        return self.constraint_engine.generated_so_far
