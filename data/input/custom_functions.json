@@ -1,0 +1,74 @@
+[
+    {
+      "name": "fn_calculate_bmi",
+      "description": "Calculates the Body Mass Index (BMI) given weight in kg and height in meters.",
+      "parameters": {
+        "weight_kg": {
+          "type": "number"
+        },
+        "height_m": {
+          "type": "number"
+        }
+      },
+      "returns": {
+        "type": "number"
+      }
+    },
+    {
+      "name": "fn_reverse_string",
+      "description": "Reverses a given string.",
+      "parameters": {
+        "s": {
+          "type": "string"
+        }
+      },
+      "returns": {
+        "type": "string"
+      }
+    },
+    {
+      "name": "fn_extract_user_contact",
+      "description": "Extracts user contact information from a natural language string.",
+      "parameters": {
+        "first_name": {
+          "type": "string"
+        },
+        "last_name": {
+          "type": "string"
+        },
+        "email_address": {
+          "type": "string"
+        }
+      },
+      "returns": {
+        "type": "string"
+      }
+    },
+    {
+      "name": "fn_get_weather_forecast",
+      "description": "Gets the weather forecast for a specific city for a certain number of days.",
+      "parameters": {
+        "city_name": {
+          "type": "string"
+        },
+        "days_to_forecast": {
+          "type": "number"
+        }
+      },
+      "returns": {
+        "type": "string"
+      }
+    },
+    {
+      "name": "fn_generate_password",
+      "description": "Generates a secure password of a specific length.",
+      "parameters": {
+        "length": {
+          "type": "number"
+        }
+      },
+      "returns": {
+        "type": "string"
+      }
+    }
+  ]

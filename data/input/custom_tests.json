@@ -1,0 +1,38 @@
+[
+    {
+      "prompt": "Calculate the BMI for someone who weighs 999999999999.99 kg and is 1.2 meters tall.",
+      "_note": "EDGE CASE: Extremely large number with decimals."
+    },
+    {
+      "prompt": "Reverse this string: ''",
+      "_note": "EDGE CASE: Empty string extraction."
+    },
+    {
+      "prompt": "Extract contact info: My name is O'Connor, D'Artagnan. Email: weird+chars!#$%@domain.co.uk.",
+      "_note": "EDGE CASE: Special characters in multiple string parameters."
+    },
+    {
+      "prompt": "I am very heavy and quite tall. What is my BMI?",
+      "_note": "EDGE CASE: Ambiguous prompt / Missing numbers. The LLM must still output valid JSON, even if it invents numbers or extracts nothing."
+    },
+    {
+      "prompt": "Get the weather forecast for 'Llanfairpwllgwyngyllgogerychwyrndrobwllllantysiliogogogoch' for -5 days.",
+      "_note": "EDGE CASE: Extremely long string and a negative number type."
+    },
+    {
+      "prompt": "Generate a password with length: twenty-five.",
+      "_note": "EDGE CASE: Wrong type in text (word instead of digit). The engine MUST force a numeric digit, forcing the LLM to translate 'twenty-five' to 25, or guess."
+    },
+    {
+      "prompt": "Extract the contact info for a user named 'John 'The Boss' Doe' who uses the email boss@company.com.",
+      "_note": "EDGE CASE: 'Escaped Quote'."
+    },
+    {
+      "prompt": "Get the weather forecast for 🗼Tokyo, Japan 🇯🇵 for 14 days. 🌧️",
+      "_note": "EDGE CASE: emojis."
+    },
+    {
+      "prompt": "I weigh 80kg and I am 1.8m tall. Also, my name is John and I want a 12-character password. Calculate my BMI",
+      "_note": "EDGE CASE: Ultimate distractor."
+    }
+  ]

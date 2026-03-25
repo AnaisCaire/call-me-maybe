@@ -2,7 +2,7 @@ from pydantic import BaseModel, ValidationError
 from typing import Dict, Literal, Optional, List
 from pathlib import Path
 import json
-import os
+import sys
 
 
 class Paramcheck(BaseModel):
@@ -28,21 +28,35 @@ class Parsing:
         self.functions: List[FunctionDef] = []
 
     def load_def(self) -> List[FunctionDef]:
-
-        if not os.path.exists(self.file_path):
-            raise FileNotFoundError(f"File not found: {self.file_path}")
+        if not self.file_path.exists():
+            print("[ERROR] Function definition file not found:",
+                  self.file_path, file=sys.stderr)
+            sys.exit(1)
         try:
             with open(self.file_path, 'r') as f:
                 def_json = json.load(f)
-                for item in def_json:
-                    try:
-                        json_functiondef = FunctionDef(**item)
-                        self.functions.append(json_functiondef)
-                    except ValidationError as e:
-                        print(f'[ERROR WARNING] {e}')
-                        # import pdb
-                        # pdb.set_trace()
-                        continue
-                return self.functions
-        except ValueError:
-            raise ValueError
+        except json.JSONDecodeError as e:
+            print("[ERROR] Invalid JSON in function definition file:",
+                  e, file=sys.stderr)
+            sys.exit(1)
+
+        if not isinstance(def_json, list):
+            print("[ERROR] Function definitions must be a JSON array at the root.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        for item in def_json:
+            try:
+                json_functiondef = FunctionDef(**item)
+                self.functions.append(json_functiondef)
+            except ValidationError as e:
+                print(f"[WARNING] Skipping invalid function schema "
+                      f"'{item.get('name', 'Unknown')}': {e.errors()[0]['msg']}")
+                continue
+
+        if not self.functions:
+            print("[ERROR] No valid functions could be loaded. Exiting.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        return self.functions

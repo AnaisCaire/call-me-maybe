@@ -5,6 +5,7 @@ import json
 from enum import Enum, auto
 import numpy as np
 
+
 class GenState(Enum):
     """Tracks where we are in the JSON structure being generated."""
     FUNC_NAME = auto()    # generating the value of "name"
@@ -15,6 +16,7 @@ class GenState(Enum):
     BETWEEN_PARAMS = auto() # Bridge: handles ", " between parameters
     CLOSING = auto()      # writing the two closing braces "}}"
     DONE = auto()         # generation complete — stop
+
 
 class ConstraintEngine:
     """
@@ -31,19 +33,53 @@ class ConstraintEngine:
         self.functions = functions
         self.vocab_size = model_vocab_size
 
-        # Pre-calculate categories for O(1) masking speed (Requirement V.5)
         self._token_clean_map: dict[int, str] = {
             tid: s.replace("\u0120", " ")  # Normalise Ġ to space
             for tid, s in vocab.items()
         }
 
-        self.quote_tokens = [tid for tid, s in vocab.items() if s.endswith('"')]
-        self.comma_tokens = [tid for tid, s in vocab.items() if s.endswith(",")]
-        self.brace_close_tokens = [tid for tid, s in vocab.items() if s.endswith("}")]
-        self.numeric_tokens = [
+        # --- PRE-COMPUTED NUMPY MASKS (O(1) Speed - V.5) ---
+        
+        self.quote_tokens = np.array([
+            tid for tid, s in self._token_clean_map.items() if s.strip() == '"'
+        ], dtype=np.int32)
+
+        # Safe String Content (NO quotes allowed inside these tokens)
+        self.safe_string_content = np.array([
+            tid for tid, s in self._token_clean_map.items() if '"' not in s
+        ], dtype=np.int32)
+
+        # String Closers (Last Param -> must go to CLOSING, no commas allowed)
+        safe_brace = []
+        for tid, s in self._token_clean_map.items():
+            if s.count('"') == 1:
+                after = s.split('"')[1]
+                if all(c in " }\n\r\t" for c in after):
+                    safe_brace.append(tid)
+        self.safe_brace_closers = np.array(safe_brace, dtype=np.int32)
+
+        # String Closers (More Params -> must go to BETWEEN_PARAMS, no braces allowed)
+        safe_comma = []
+        for tid, s in self._token_clean_map.items():
+            if s.count('"') == 1:
+                after = s.split('"')[1]
+                if all(c in " ,\n\r\t" for c in after) and after.count(",") <= 1:
+                    safe_comma.append(tid)
+        self.safe_comma_closers = np.array(safe_comma, dtype=np.int32)
+
+        # Strict Numbers
+        self.numeric_tokens = np.array([
             tid for tid, s in self._token_clean_map.items()
             if len(s) > 0 and all(c in " 0123456789.-" for c in s)
-        ]
+        ], dtype=np.int32)
+
+        self.strict_comma_tokens = np.array([
+            tid for tid, s in self._token_clean_map.items() if s.strip() in [",", ", "]
+        ], dtype=np.int32)
+
+        self.strict_brace_tokens = np.array([
+            tid for tid, s in self._token_clean_map.items() if s.strip() in ["}", "}}"]
+        ], dtype=np.int32)
 
         self.reset()
 
@@ -69,7 +105,7 @@ class ConstraintEngine:
 
         elif self.state == GenState.PARAM_KEY:
             if not self.in_key_body:
-                for tid in self.quote_tokens: mask[tid] = 0.0
+                mask[self.quote_tokens] = 0.0
             else:
                 fragment = self.generated_so_far.split('"')[-1]
                 remaining_keys = [p for p in self.selected_function.parameters if p not in self.filled_params]
@@ -94,20 +130,24 @@ class ConstraintEngine:
 
             if param_def.type == "string":
                 if not self.in_string_value:
-                    for tid in self.quote_tokens: mask[tid] = 0.0
+                    mask[self.quote_tokens] = 0.0
                 else:
-                    mask[:] = 0.0  # Allow text inside string
-                    for tid in self.brace_close_tokens: mask[tid] = -1e9
+                    # Apply strict Context-Aware Closers
+                    mask[self.safe_string_content] = 0.0
+                    if more_params_follow:
+                        mask[self.safe_comma_closers] = 0.0
+                    else:
+                        mask[self.safe_brace_closers] = 0.0
+
             elif param_def.type == "number":
-                for tid in self.numeric_tokens: mask[tid] = 0.0
+                mask[self.numeric_tokens] = 0.0
                 if more_params_follow:
-                    for tid in self.comma_tokens: mask[tid] = 0.0
+                    mask[self.strict_comma_tokens] = 0.0
                 else:
-                    for tid in self.brace_close_tokens: mask[tid] = 0.0
+                    mask[self.strict_brace_tokens] = 0.0
 
         elif self.state == GenState.BETWEEN_PARAMS:
             target = ", "
-            # Check what is missing from the ", " sequence (Idempotent check)
             already = ""
             for i in range(len(target), 0, -1):
                 if self.generated_so_far.endswith(target[:i]):
@@ -115,15 +155,15 @@ class ConstraintEngine:
                     break
             remaining = target[len(already):]
             
-            if remaining == "": # Safety transition
-                for tid in self.quote_tokens: mask[tid] = 0.0
+            if remaining == "": 
+                mask[self.quote_tokens] = 0.0
             else:
                 for tid, s in self._token_clean_map.items():
                     if remaining.startswith(s) and len(s) > 0:
                         mask[tid] = 0.0
 
         elif self.state == GenState.CLOSING:
-            for tid in self.brace_close_tokens: mask[tid] = 0.0
+            mask[self.strict_brace_tokens] = 0.0
 
         return mask
 
@@ -159,15 +199,36 @@ class ConstraintEngine:
 
         elif self.state == GenState.PARAM_VALUE:
             p_type = self.selected_function.parameters[self.current_param].type
-            if p_type == "string" and '"' in token_str:
-                # Toggle string state
-                self.in_string_value = not self.in_string_value
-                if not self.in_string_value: self._transition_after_value()
+            
+            if p_type == "string":
+                quote_count = token_str.count('"')
+                if quote_count > 0:
+                    # Toggle state if an odd number of quotes is found
+                    if quote_count % 2 == 1:
+                        self.in_string_value = not self.in_string_value
+                    
+                    # If we just closed the string, transition!
+                    if not self.in_string_value:
+                        self._transition_after_value()
+                        
+                        # BPE CATCH: Check if a closing brace sneaked in with the quote
+                        if self.state == GenState.CLOSING and "}" in token_str:
+                            after_quote = token_str.split('"')[-1]
+                            braces = after_quote.count("}")
+                            if braces >= 2 or (braces == 1 and self.closing_first_done):
+                                self.state = GenState.DONE
+                            elif braces == 1:
+                                self.closing_first_done = True
+
             elif p_type == "number":
-                if "," in token_str: self._transition_after_value()
+                if "," in token_str: 
+                    self._transition_after_value()
                 elif "}" in token_str:
                     self.closing_first_done = True
-                    self.state = GenState.CLOSING
+                    if token_str.count("}") >= 2:
+                        self.state = GenState.DONE
+                    else:
+                        self.state = GenState.CLOSING
 
         elif self.state == GenState.BETWEEN_PARAMS:
             if self.generated_so_far.endswith(', '):
@@ -176,7 +237,6 @@ class ConstraintEngine:
 
         elif self.state == GenState.CLOSING:
             if "}" in token_str:
-                # Handle single '}' or merged '}}' tokens
                 count = token_str.count("}")
                 if count >= 2 or self.closing_first_done:
                     self.state = GenState.DONE
@@ -186,8 +246,9 @@ class ConstraintEngine:
     def _transition_after_value(self) -> None:
         remaining = [p for p in self.selected_function.parameters if p not in self.filled_params]
         if remaining:
-            # If the model already provided the comma, jump straight to KEY
-            if self.generated_so_far.endswith(', '):
+            # Check if a comma exists in the text immediately following the quote (BPE bridge detection)
+            after_quote = self.generated_so_far.split('"')[-1]
+            if "," in after_quote:
                 self.state = GenState.PARAM_KEY
                 self.in_key_body = False
             else:
@@ -237,18 +298,27 @@ class GenerationEngine:
             f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
             f'<|im_start|>assistant\n{{"name": "'
         )
-        
+
         input_ids = self.model.encode(full_prompt)[0].tolist()
         self.constraint_engine.reset()
 
         while not self.constraint_engine.is_complete():
             logits = np.array(self.model.get_logits_from_input_ids(input_ids), dtype=np.float32)
             mask = self.constraint_engine.get_valid_mask()
+
             # Requirement V.3.3: Intervention via logit bias
             next_token_id = int(np.argmax(logits + mask))
             input_ids.append(next_token_id)
+
+            # Update state machine based on token choice
             self.constraint_engine.update_state(next_token_id)
-            
-            if len(input_ids) > 512: break
-            
+
+            # IMMEDIATE EXIT: Chop off the generation exactly when done to prevent garbage
+            if self.constraint_engine.is_complete():
+                break
+
+            # Safety Limit
+            if len(input_ids) > 2048:
+                break
+
         return self.constraint_engine.generated_so_far

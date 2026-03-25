@@ -1,0 +1,59 @@
+[
+  {
+    "prompt": "What is the BMI for someone who weighs 75.5 kilos and has a height of 1.82 meters?",
+    "name": "fn_calculate_bmi",
+    "parameters": {
+      "weight_kg": 75.5,
+      "height_m": 1.82
+    }
+  },
+  {
+    "prompt": "Hey assistant, please figure out the body mass index for my friend. He is about 1.75m tall and weighs 80.2 kg.",
+    "name": "fn_calculate_bmi",
+    "parameters": {
+      "weight_kg": 80.2,
+      "height_m": 1.75
+    }
+  },
+  {
+    "prompt": "My name is John Doe and my email is john.doe@example-company.com.",
+    "name": "fn_extract_user_contact",
+    "parameters": {
+      "first_name": "John",
+      "last_name": "Doe",
+      "email_address": "john.doe@example-company.com"
+    }
+  },
+  {
+    "prompt": "Register a new user: Alice Smith. You can contact her at alice+test123@gmail.com.",
+    "name": "fn_extract_user_contact",
+    "parameters": {
+      "first_name": "Alice",
+      "last_name": "Smith",
+      "email_address": "alice+test123@gmail.com"
+    }
+  },
+  {
+    "prompt": "What will the weather be like in Tokyo for the next 3 days?",
+    "name": "fn_get_weather_forecast",
+    "parameters": {
+      "city_name": "Tokyo",
+      "days_to_forecast": 3
+    }
+  },
+  {
+    "prompt": "I'm travelling to San Francisco next week. Can you give me a 7 day forecast?",
+    "name": "fn_get_weather_forecast",
+    "parameters": {
+      "city_name": "San Francisco",
+      "days_to_forecast": 7
+    }
+  },
+  {
+    "prompt": "Create a highly secure, randomized password that is exactly 16 characters long.",
+    "name": "fn_generate_password",
+    "parameters": {
+      "length": 16
+    }
+  }
+]
