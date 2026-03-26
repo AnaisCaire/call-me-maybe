@@ -1,9 +1,52 @@
 import argparse
 from pathlib import Path
-from src.parser import Parsing
+from src.parser import Parsing, FunctionDef
 from src.generation_engine import GenerationEngine
 # import pdb
 import sys, json, time
+from typing import List
+
+
+_PYTHON_TYPE_FOR = {"string": str, "number": (int, float)}
+
+
+def validate_call(call_data: dict, functions: List[FunctionDef]) -> str | None:
+    """
+    Validates a decoded call dict against the loaded FunctionDef schemas.
+
+    Returns None on success, or a human-readable error string describing the
+    first violation found (unknown function, missing param, extra param, wrong type).
+    """
+    name = call_data.get("name")
+    func_def = next((f for f in functions if f.name == name), None)
+    if func_def is None:
+        return f"unknown function name: {name!r}"
+
+    params = call_data.get("parameters")
+    if not isinstance(params, dict):
+        return "'parameters' is missing or not an object"
+
+    expected = set(func_def.parameters)
+    actual = set(params)
+
+    missing = expected - actual
+    if missing:
+        return f"missing required parameters: {sorted(missing)}"
+
+    extra = actual - expected
+    if extra:
+        return f"unexpected parameters: {sorted(extra)}"
+
+    for param_name, param_def in func_def.parameters.items():
+        value = params[param_name]
+        expected_type = _PYTHON_TYPE_FOR[param_def.type]
+        if not isinstance(value, expected_type):
+            return (
+                f"parameter {param_name!r} expected {param_def.type}, "
+                f"got {type(value).__name__}: {value!r}"
+            )
+
+    return None
 
 
 def main():
@@ -63,17 +106,24 @@ def main():
         user_prompt = entry["prompt"]
         generate.generate_call(user_prompt)
         print(f"DEBUG: {repr(generate.constraint_engine.generated_so_far)}")
-        # The result must be valid JSON to be stored in the list
         try:
             call_data = json.loads(generate.constraint_engine.generated_so_far)
-            results.append({
-                "prompt": user_prompt,
-                "name": call_data.get("name"),
-                "parameters": call_data.get("parameters")
-            })
         except json.JSONDecodeError:
-            print("[ERROR]: Model produced invalid JSON for prompt:",
-                  user_prompt)
+            print(f"[ERROR] Model produced invalid JSON for prompt: {user_prompt!r}",
+                  file=sys.stderr)
+            continue
+
+        error = validate_call(call_data, functions)
+        if error:
+            print(f"[ERROR] Schema validation failed for prompt {user_prompt!r}: {error}",
+                  file=sys.stderr)
+            continue
+
+        results.append({
+            "prompt": user_prompt,
+            "name": call_data["name"],
+            "parameters": call_data["parameters"],
+        })
 
     # Step 4: Write the single output file (Mandatory V.4)
     with open(arg.output, 'w') as f:

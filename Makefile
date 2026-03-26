@@ -15,6 +15,12 @@ run:
 		--input $(INPUT) \
 		--output $(OUTPUT)
 
+test:
+	uv run python -m src \
+		--functions_definition data/input/custom_functions.json \
+		--input data/input/custom_tests.json \
+		--output data/output/custom_results.json
+
 clean:
 	rm -rf .mypy_cache .pytest_cache
 	find . -type d -name "__pycache__" -exec rm -rf {} +
