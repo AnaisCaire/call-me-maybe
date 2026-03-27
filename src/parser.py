@@ -20,7 +20,7 @@ class FunctionDef(BaseModel):
 
 class Parsing:
     """
-        parse the files from JSON format to list of 
+        parse the files from JSON format to list of
         functiondef format
     """
     def __init__(self, file_path: Path) -> None:
@@ -41,7 +41,7 @@ class Parsing:
             sys.exit(1)
 
         if not isinstance(def_json, list):
-            print("[ERROR] Function definitions must be a JSON array at the root.",
+            print("[ERROR] Function definitions must be a JSON array.",
                   file=sys.stderr)
             sys.exit(1)
 
@@ -51,7 +51,8 @@ class Parsing:
                 self.functions.append(json_functiondef)
             except ValidationError as e:
                 print(f"[WARNING] Skipping invalid function schema "
-                      f"'{item.get('name', 'Unknown')}': {e.errors()[0]['msg']}")
+                      f"'{item.get('name', 'Unknown')}': "
+                      f"{e.errors()[0]['msg']}")
                 continue
 
         if not self.functions:

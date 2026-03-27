@@ -1,21 +1,17 @@
-import argparse
-from pathlib import Path
+import argparse, sys, json, time
+# import pdb
+
 from src.parser import Parsing, FunctionDef
 from src.generation_engine import GenerationEngine
-# import pdb
-import sys, json, time
+
 from typing import List
-
-
-_PYTHON_TYPE_FOR = {"string": str, "number": (int, float)}
+from pathlib import Path
 
 
 def validate_call(call_data: dict, functions: List[FunctionDef]) -> str | None:
     """
-    Validates a decoded call dict against the loaded FunctionDef schemas.
-
-    Returns None on success, or a human-readable error string describing the
-    first violation found (unknown function, missing param, extra param, wrong type).
+    Validates final output against the loaded FunctionDef schemas.
+    match functiondef to genereate call to make sure a valid call is made
     """
     name = call_data.get("name")
     func_def = next((f for f in functions if f.name == name), None)
@@ -39,7 +35,8 @@ def validate_call(call_data: dict, functions: List[FunctionDef]) -> str | None:
 
     for param_name, param_def in func_def.parameters.items():
         value = params[param_name]
-        expected_type = _PYTHON_TYPE_FOR[param_def.type]
+        python_type_for = {"string": str, "number": (int, float)}
+        expected_type = python_type_for[param_def.type]
         if not isinstance(value, expected_type):
             return (
                 f"parameter {param_name!r} expected {param_def.type}, "
@@ -109,23 +106,23 @@ def main():
         try:
             call_data = json.loads(generate.constraint_engine.generated_so_far)
         except json.JSONDecodeError:
-            print(f"[ERROR] Model produced invalid JSON for prompt: {user_prompt!r}",
+            print("[ERROR] Model produced invalid JSON for prompt",
                   file=sys.stderr)
             continue
 
         error = validate_call(call_data, functions)
         if error:
-            print(f"[ERROR] Schema validation failed for prompt {user_prompt!r}: {error}",
+            print("[ERROR] Schema validation failed for prompt",
+                  f"{user_prompt!r}: {error}",
                   file=sys.stderr)
             continue
-
         results.append({
             "prompt": user_prompt,
             "name": call_data["name"],
             "parameters": call_data["parameters"],
         })
 
-    # Step 4: Write the single output file (Mandatory V.4)
+    # Step 4: Write the single output file
     with open(arg.output, 'w') as f:
         json.dump(results, f, indent=2)
 
@@ -136,7 +133,6 @@ def main():
 
     print(f"\n[SUCCESS] Results saved to {arg.output}")
     print(f"[TIMER] Total execution time: {minutes}m {seconds:.2f}s")
-    # Optional: Print average time per prompt
     if len(test_data) > 0:
         avg_time = elapsed_time / len(test_data)
         print(f"[TIMER] Average time per prompt: {avg_time:.2f}s")
