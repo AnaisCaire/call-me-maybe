@@ -11,7 +11,7 @@ class Paramcheck(BaseModel):
 
 
 class FunctionDef(BaseModel):
-    """Validate data of functions"""
+    """Validate data of functions with pydantic model"""
     name: str
     description: Optional[str] = None
     parameters: Dict[str, Paramcheck]

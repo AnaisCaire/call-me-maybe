@@ -50,6 +50,10 @@ def main():
     """
     1. take the arguments
     2. makes sure that if none is given, there are the defaults
+    3. parsing + loading JSON
+    4. generate with constrained decoding for each prompt 
+    5. append result to output file
+    6. timer to ensure speed
     """
 
     parser = argparse.ArgumentParser(description="the 3 input files")
@@ -72,11 +76,11 @@ def main():
 
     arg = parser.parse_args()
 
-    # Step 1: Load Function Definitions
+    # 1: Load Function Definitions
     parser_instance = Parsing(arg.functions_definition)
     functions = parser_instance.load_def()
 
-    # Step 2: Load Test Prompts
+    # 2: Load Test Prompts
     if not arg.input.exists():
         print(f"[ERROR] Test prompts file not found: {arg.input}",
               file=sys.stderr)
@@ -97,7 +101,7 @@ def main():
     generate = GenerationEngine(functions=functions)
     results = []
     print(f"\n[INFO] Starting generation for {len(test_data)} prompts...")
-    # Step 3: Loop through prompts
+    # 3: Loop through prompts
     start_time = time.perf_counter()
     for entry in test_data:
         user_prompt = entry["prompt"]
@@ -122,7 +126,7 @@ def main():
             "parameters": call_data["parameters"],
         })
 
-    # Step 4: Write the single output file
+    # 4: Write the single output file
     with open(arg.output, 'w') as f:
         json.dump(results, f, indent=2)
 

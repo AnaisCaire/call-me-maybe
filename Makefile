@@ -10,7 +10,8 @@ install:
 	uv sync
 
 run:
-	uv run python -m src \
+	@mkdir -p /goinfre/$(USER)/.cache/huggingface
+	HF_HOME=/goinfre/$(USER)/.cache/huggingface uv run python -m src \
 		--functions_definition $(FUNC_DEF) \
 		--input $(INPUT) \
 		--output $(OUTPUT)

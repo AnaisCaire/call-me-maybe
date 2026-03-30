@@ -9,58 +9,53 @@ class NumericConstraint(BaseModel):
     """
     Context-aware numeric token validator.
     Separates 'discovery' (which chars are allowed) from 'validation'
-    (is this token valid given what's already been generated?).
     """
     allowed_chars: Set[str] = set("0123456789.-")
 
-    def get_valid_continuation_tokens(
-        self, current_buffer: str, candidates: list[tuple[int, str]]
-    ) -> List[int]:
-        """Returns token IDs that keep current_buffer + token a valid partial JSON number.
-
-        Args:
-            current_buffer: digits already generated for this number value.
-            candidates: pre-filtered (tid, token_str) pairs — every character
-                        already confirmed to be in allowed_chars, so this list
-                        is O(tens) rather than O(full vocab).
+    def get_valid_continuation_tokens(self, current_buffer: str,
+                                      candidates: list[tuple[int, str]]
+                                      ) -> List[int]:
         """
-        return [tid for tid, s in candidates if self._is_valid_continuation(current_buffer, s)]
+        ARG:
+            - current_buffer : generated_so_far
+            - candidates : pre-processed list of every token ID
+                and string representation from the inverted vocabulary.
+        """
+        return [tid
+                for tid, s in candidates
+                if self._is_valid_continuation(current_buffer, s)]
 
     def _is_valid_continuation(self, buffer: str, token: str) -> bool:
         if not token:
             return False
         candidate = buffer + token
-        # All characters must be numeric-safe
         if not all(c in self.allowed_chars for c in candidate):
             return False
         # Must start with a digit or '-', never '.'
         if candidate[0] not in "-0123456789":
             return False
-        # '-' only allowed at position 0
         if "-" in candidate[1:]:
             return False
-        # At most one decimal point
         if candidate.count(".") > 1:
             return False
         return True
 
 
 class GenState(Enum):
-    """Tracks where we are in the JSON structure being generated."""
-    FUNC_NAME = auto()    # generating the value of "name"
-    AFTER_NAME = auto()   # generating the literal: ", "parameters": {"
-    PARAM_KEY = auto()    # generating a parameter key (with its quotes)
-    AFTER_PARAM = auto()  # generating the literal ": "
+    """Tracks where we are in the JSON structure while being generated."""
+    FUNC_NAME = auto()    # generating "name"
+    AFTER_NAME = auto()   # generating: ", "parameters": {"
+    PARAM_KEY = auto()    # generating a parameter key (with quotes)
+    AFTER_PARAM = auto()  # generating: ": "
     PARAM_VALUE = auto()  # generating a parameter value
     BETWEEN_PARAMS = auto()  # Bridge: handles ", " between parameters
-    CLOSING = auto()      # writing the two closing braces "}}"
-    DONE = auto()         # generation complete — stop
+    CLOSING = auto()      # writing "}}"
+    DONE = auto()         # generation done
 
 
 class ConstraintEngine:
     """
-    Token-aware constraint engine for 100% valid JSON function calls.
-    Satisfies Chapter V.3.3 (Constrained Decoding) and V.5 (Performance).
+    Token-aware constraint engine for JSON function calls.
     """
 
     def __init__(
@@ -74,21 +69,19 @@ class ConstraintEngine:
 
         self._token_clean_map: dict[int, str] = {
             tid: s.replace("\u0120", " ")  # Normalise Ġ to space
-            for tid, s in vocab.items()
-        }
+            for tid, s in vocab.items()}
 
-        # --- PRE-COMPUTED NUMPY MASKS (O(1) Speed - V.5) ---
+        # --- SPECIALIZED FILER: PRE-COMPUTED NUMPY MASKS ---
 
         self.quote_tokens = np.array([
             tid for tid, s in self._token_clean_map.items() if s.strip() == '"'
         ], dtype=np.int32)
-
-        # Safe String Content (NO quotes allowed inside these tokens)
         self.safe_string_content = np.array([
             tid for tid, s in self._token_clean_map.items() if '"' not in s
         ], dtype=np.int32)
 
-        # String Closers (Last Param -> must go to CLOSING, no commas allowed)
+        # Brace Closers (Last Param -> go to CLOSING, no commas)
+        # String Closers (More Params -> go to BETWEEN_PARAMS, no braces)
         safe_brace = []
         for tid, s in self._token_clean_map.items():
             if s.count('"') == 1:
@@ -96,34 +89,35 @@ class ConstraintEngine:
                 if all(c in " }\n\r\t" for c in after):
                     safe_brace.append(tid)
         self.safe_brace_closers = np.array(safe_brace, dtype=np.int32)
-
-        # String Closers (More Params -> must go to BETWEEN_PARAMS, no braces allowed)
         safe_comma = []
         for tid, s in self._token_clean_map.items():
             if s.count('"') == 1:
                 after = s.split('"')[1]
-                if all(c in " ,\n\r\t" for c in after) and after.count(",") <= 1:
+                if all(
+                    c in " ,\n\r\t" for c in after
+                ) and after.count(",") <= 1:
                     safe_comma.append(tid)
         self.safe_comma_closers = np.array(safe_comma, dtype=np.int32)
 
-        self.numeric_constraint = NumericConstraint()
-
-        # Pre-filtered numeric candidates: tokens whose every character is in
-        # "0123456789.-".  The context-aware checks (single dot, leading minus,
-        # etc.) still run at call-time, but only against this tiny subset instead
-        # of all 150 k vocab entries.
+        # Two-step architechture:
+        # 1. loops 151,000 tokens with:
+        # Does this token contain only numbers/decimals/minuses?
+        # happends only once
         self._numeric_candidate_tokens: list[tuple[int, str]] = [
             (tid, s)
             for tid, s in self._token_clean_map.items()
-            if s and all(c in "0123456789.-" for c in s)
-        ]
+            if s and all(c in "0123456789.-" for c in s)]
+        # 2. checks valid number (double decimals, invalid minus sign...)
+        self.numeric_constraint = NumericConstraint()
 
         self.strict_comma_tokens = np.array([
-            tid for tid, s in self._token_clean_map.items() if s.strip() in [",", ", "]
+            tid for tid, s in self._token_clean_map.items()
+            if s.strip() in [",", ", "]
         ], dtype=np.int32)
 
         self.strict_brace_tokens = np.array([
-            tid for tid, s in self._token_clean_map.items() if s.strip() in ["}", "}}"]
+            tid for tid, s in self._token_clean_map.items()
+            if s.strip() in ["}", "}}"]
         ], dtype=np.int32)
 
         # --- COMPILE-TIME LITERAL BRIDGE INDICES (shift O(N) work to init) ---
