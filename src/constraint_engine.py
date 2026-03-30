@@ -1,5 +1,5 @@
 from src.parser import FunctionDef
-from typing import List, Set
+from typing import List, Set, cast
 from enum import Enum, auto
 from pydantic import BaseModel
 import numpy as np
@@ -138,6 +138,14 @@ class ConstraintEngine:
         self.param_key_indices: dict[str, dict[str, dict[str, list[int]]]] = \
             self._build_param_key_indices()
 
+        self.generated_so_far: str
+        self.state: GenState
+        self.selected_function: FunctionDef
+        self.current_param: str
+        self.filled_params: Set[str]
+        self.in_key_body: bool
+        self.in_string_value: bool
+        self.closing_first_done: bool
         self.reset()
 
     # ------------------------------------------------------------------
@@ -226,7 +234,7 @@ class ConstraintEngine:
             raise AssertionError(
                 f"FUNC_NAME error: fragment={fragment!r} "
                 "is not a prefix of any known function name. Known names:",
-                {[f.name for f in self.functions]})
+                [f.name for f in self.functions])
 
         elif self.state == GenState.AFTER_NAME:
             already = \
@@ -237,7 +245,7 @@ class ConstraintEngine:
             raise AssertionError(
                 f"AFTER_NAME error: key={already!r} ",
                 "not in pre-computed index. Keys present:",
-                {list(self.literal_indices[GenState.AFTER_NAME])})
+                list(self.literal_indices[GenState.AFTER_NAME]))
 
         elif self.state == GenState.PARAM_KEY:
             mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
@@ -262,7 +270,7 @@ class ConstraintEngine:
             raise AssertionError(
                 f"AFTER_PARAM error: key={already!r}",
                 "not in pre-computed index. Keys present:",
-                {list(self.literal_indices[GenState.AFTER_PARAM])})
+                list(self.literal_indices[GenState.AFTER_PARAM]))
 
         elif self.state == GenState.PARAM_VALUE:
             mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
@@ -310,7 +318,7 @@ class ConstraintEngine:
             raise AssertionError(
                 f"BETWEEN_PARAMS error: key={already!r} ",
                 "not in pre-computed index. Keys present:",
-                {list(self.literal_indices[GenState.BETWEEN_PARAMS])})
+                list(self.literal_indices[GenState.BETWEEN_PARAMS]))
 
         elif self.state == GenState.CLOSING:
             mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
@@ -424,8 +432,8 @@ class ConstraintEngine:
     def reset(self) -> None:
         self.generated_so_far = '{"name": "'
         self.state = GenState.FUNC_NAME
-        self.selected_function = None
-        self.current_param = None
+        self.selected_function = cast(FunctionDef, None)
+        self.current_param = cast(str, None)
         self.filled_params = set()
         self.in_key_body = False
         self.in_string_value = False

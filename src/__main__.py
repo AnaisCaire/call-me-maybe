@@ -38,7 +38,8 @@ def validate_call(call_data: dict, functions: List[FunctionDef]) -> str | None:
 
     for param_name, param_def in func_def.parameters.items():
         value = params[param_name]
-        python_type_for = {"string": str, "number": (int, float)}
+        python_type_for: dict[str, type | tuple[type, ...]] = \
+            {"string": str, "number": (int, float)}
         expected_type = python_type_for[param_def.type]
         if not isinstance(value, expected_type):
             return (
@@ -49,7 +50,7 @@ def validate_call(call_data: dict, functions: List[FunctionDef]) -> str | None:
     return None
 
 
-def main():
+def main() -> None:
     """
     1. take the arguments
     2. makes sure that if none is given, there are the defaults
@@ -109,7 +110,7 @@ def main():
     for entry in test_data:
         user_prompt = entry["prompt"]
         generate.generate_call(user_prompt)
-        print(f"DEBUG: {repr(generate.constraint_engine.generated_so_far)}")
+        print(f"OUTPUT: {repr(generate.constraint_engine.generated_so_far)}")
         try:
             call_data = json.loads(generate.constraint_engine.generated_so_far)
         except json.JSONDecodeError:
