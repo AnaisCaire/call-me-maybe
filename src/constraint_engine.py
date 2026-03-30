@@ -187,7 +187,8 @@ class ConstraintEngine:
             index[fragment] = mask
         return index
 
-    def _build_param_key_indices(self) -> dict[str, dict[str, dict[str, list[int]]]]:
+    def _build_param_key_indices(
+            self) -> dict[str, dict[str, dict[str, list[int]]]]:
         """
         Pre-computes per-function, per-param: {fragment → [valid_token_ids]}.
         """
@@ -223,7 +224,7 @@ class ConstraintEngine:
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"FUNC_NAME cache miss: fragment={fragment!r} "
+                f"FUNC_NAME error: fragment={fragment!r} "
                 "is not a prefix of any known function name. Known names:",
                 {[f.name for f in self.functions]})
 
@@ -234,7 +235,7 @@ class ConstraintEngine:
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"AFTER_NAME cache miss: key={already!r} ",
+                f"AFTER_NAME error: key={already!r} ",
                 "not in pre-computed index. Keys present:",
                 {list(self.literal_indices[GenState.AFTER_NAME])})
 
@@ -259,7 +260,7 @@ class ConstraintEngine:
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"AFTER_PARAM cache miss: key={already!r}",
+                f"AFTER_PARAM error: key={already!r}",
                 "not in pre-computed index. Keys present:",
                 {list(self.literal_indices[GenState.AFTER_PARAM])})
 
@@ -307,7 +308,7 @@ class ConstraintEngine:
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"BETWEEN_PARAMS cache miss: key={already!r} ",
+                f"BETWEEN_PARAMS error: key={already!r} ",
                 "not in pre-computed index. Keys present:",
                 {list(self.literal_indices[GenState.BETWEEN_PARAMS])})
 
@@ -365,11 +366,17 @@ class ConstraintEngine:
                     if not self.in_string_value:
                         self._transition_after_value()
 
-                        # BPE CATCH:Check if a closing brace sneaked in with the quote
+                        # Check if a closing brace is in the quote
                         if self.state == GenState.CLOSING and "}" in token_str:
                             after_quote = token_str.split('"')[-1]
                             braces = after_quote.count("}")
-                            if braces >= 2 or (braces == 1 and self.closing_first_done):
+                            if (
+                                braces >= 2
+                                or (
+                                    braces == 1
+                                    and self.closing_first_done
+                                )
+                            ):
                                 self.state = GenState.DONE
                             elif braces == 1:
                                 self.closing_first_done = True
@@ -398,9 +405,10 @@ class ConstraintEngine:
                     self.closing_first_done = True
 
     def _transition_after_value(self) -> None:
-        remaining = [p for p in self.selected_function.parameters if p not in self.filled_params]
+        remaining = [p for p in self.selected_function.parameters
+                     if p not in self.filled_params]
         if remaining:
-            # Check if a comma exists in the text immediately following the quote (BPE bridge detection)
+            # Check if a comma exists in the text immediately after quote
             after_quote = self.generated_so_far.split('"')[-1]
             if "," in after_quote:
                 self.state = GenState.PARAM_KEY

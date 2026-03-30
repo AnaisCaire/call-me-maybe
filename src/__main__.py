@@ -1,4 +1,7 @@
-import argparse, sys, json, time
+import argparse
+import sys
+import json
+import time
 # import pdb
 
 from src.parser import Parsing, FunctionDef
@@ -51,7 +54,7 @@ def main():
     1. take the arguments
     2. makes sure that if none is given, there are the defaults
     3. parsing + loading JSON
-    4. generate with constrained decoding for each prompt 
+    4. generate with constrained decoding for each prompt
     5. append result to output file
     6. timer to ensure speed
     """
