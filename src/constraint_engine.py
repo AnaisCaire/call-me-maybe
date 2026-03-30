@@ -71,7 +71,7 @@ class ConstraintEngine:
             tid: s.replace("\u0120", " ")  # Normalise Ġ to space
             for tid, s in vocab.items()}
 
-        # --- SPECIALIZED FILER: PRE-COMPUTED NUMPY MASKS ---
+        # --- SPECIALIZED FILER: for faster speed ---
 
         self.quote_tokens = np.array([
             tid for tid, s in self._token_clean_map.items() if s.strip() == '"'
@@ -99,6 +99,16 @@ class ConstraintEngine:
                     safe_comma.append(tid)
         self.safe_comma_closers = np.array(safe_comma, dtype=np.int32)
 
+        self.strict_comma_tokens = np.array([
+            tid for tid, s in self._token_clean_map.items()
+            if s.strip() in [",", ", "]
+        ], dtype=np.int32)
+
+        self.strict_brace_tokens = np.array([
+            tid for tid, s in self._token_clean_map.items()
+            if s.strip() in ["}", "}}"]
+        ], dtype=np.int32)
+
         # Two-step architechture:
         # 1. loops 151,000 tokens with:
         # Does this token contain only numbers/decimals/minuses?
@@ -110,41 +120,34 @@ class ConstraintEngine:
         # 2. checks valid number (double decimals, invalid minus sign...)
         self.numeric_constraint = NumericConstraint()
 
-        self.strict_comma_tokens = np.array([
-            tid for tid, s in self._token_clean_map.items()
-            if s.strip() in [",", ", "]
-        ], dtype=np.int32)
-
-        self.strict_brace_tokens = np.array([
-            tid for tid, s in self._token_clean_map.items()
-            if s.strip() in ["}", "}}"]
-        ], dtype=np.int32)
-
-        # --- COMPILE-TIME LITERAL BRIDGE INDICES (shift O(N) work to init) ---
+        # --- LITERAL BRIDGE INDICES ---
 
         self.literal_indices: dict[GenState, dict[str, np.ndarray]] = {
-            GenState.AFTER_NAME:     self._build_literal_index('", "parameters": {'),
-            GenState.AFTER_PARAM:    self._build_literal_index(': '),
-            GenState.BETWEEN_PARAMS: self._build_literal_index(', '),
+            GenState.AFTER_NAME:
+                self._build_literal_index('", "parameters": {'),
+            GenState.AFTER_PARAM:
+                self._build_literal_index(': '),
+            GenState.BETWEEN_PARAMS:
+                self._build_literal_index(', '),
         }
 
-        # Trie-style prefix index for function names: {fragment: mask}
+        # pre-made func name
         self.func_name_index: dict[str, np.ndarray] = self._build_name_index()
 
-        # Per-function, per-param prefix index: {func_name: {param_name: {fragment: [tid,...]}}}
+        # pre-made: {func_name: {param_name: {fragment: [tid,...]}}}
         self.param_key_indices: dict[str, dict[str, dict[str, list[int]]]] = \
             self._build_param_key_indices()
 
         self.reset()
 
     # ------------------------------------------------------------------
-    # Compile-time index builders
+    # the builders
     # ------------------------------------------------------------------
 
     def _build_literal_index(self, target: str) -> dict[str, np.ndarray]:
         """
-        Pre-computes {prefix → mask} for a static literal target.
-        'prefix' is how much of target has already been generated.
+        Pre-computes {prefix → mask} for the static literal target.
+        'prefix' is how much of target has already generated.
         The mask marks every token that can legally come next.
         """
         index: dict[str, np.ndarray] = {}
@@ -153,8 +156,7 @@ class ConstraintEngine:
             remaining = target[i:]
             valid_tids = [
                 tid for tid, s in self._token_clean_map.items()
-                if s and remaining.startswith(s)
-            ]
+                if s and remaining.startswith(s)]
             mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
             if valid_tids:
                 mask[valid_tids] = 0.0
@@ -165,7 +167,7 @@ class ConstraintEngine:
     def _build_name_index(self) -> dict[str, np.ndarray]:
         """
         Pre-computes {fragment → mask} across all function names.
-        fragment is any valid prefix of any function name.
+        fragmen = valid prefix of any function name.
         """
         all_names = [f.name for f in self.functions]
         all_prefixes: set[str] = set()
@@ -188,8 +190,6 @@ class ConstraintEngine:
     def _build_param_key_indices(self) -> dict[str, dict[str, dict[str, list[int]]]]:
         """
         Pre-computes per-function, per-param: {fragment → [valid_token_ids]}.
-        At runtime, union across remaining (unfilled) params for O(P) lookup
-        where P is the (small) number of remaining params.
         """
         result: dict[str, dict[str, dict[str, list[int]]]] = {}
         for func in self.functions:
@@ -209,11 +209,13 @@ class ConstraintEngine:
         return result
 
     # ------------------------------------------------------------------
-    # Runtime mask generation — O(1) dict lookups for all literal states
+    #  mask generation
     # ------------------------------------------------------------------
 
     def get_valid_mask(self) -> np.ndarray:
-        """Produces a logit bias mask (0.0 valid, -1e9 forbidden)."""
+        """
+        Produces a logit bias mask (0.0 valid, -1e9 forbidden) for each states
+        """
 
         if self.state == GenState.FUNC_NAME:
             fragment = self.generated_so_far.split('{"name": "')[-1]
@@ -221,19 +223,20 @@ class ConstraintEngine:
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"FUNC_NAME cache miss: fragment={fragment!r} is not a prefix of any "
-                f"known function name. Known names: {[f.name for f in self.functions]}"
-            )
+                f"FUNC_NAME cache miss: fragment={fragment!r} "
+                "is not a prefix of any known function name. Known names:",
+                {[f.name for f in self.functions]})
 
         elif self.state == GenState.AFTER_NAME:
-            already = self.generated_so_far.split(self.selected_function.name)[-1]
+            already = \
+                self.generated_so_far.split(self.selected_function.name)[-1]
             cached = self.literal_indices[GenState.AFTER_NAME].get(already)
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"AFTER_NAME cache miss: key={already!r} not in pre-computed index. "
-                f"Keys present: {list(self.literal_indices[GenState.AFTER_NAME])}"
-            )
+                f"AFTER_NAME cache miss: key={already!r} ",
+                "not in pre-computed index. Keys present:",
+                {list(self.literal_indices[GenState.AFTER_NAME])})
 
         elif self.state == GenState.PARAM_KEY:
             mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
@@ -241,7 +244,8 @@ class ConstraintEngine:
                 mask[self.quote_tokens] = 0.0
             else:
                 fragment = self.generated_so_far.split('"')[-1]
-                remaining_keys = [p for p in self.selected_function.parameters if p not in self.filled_params]
+                remaining_keys = [p for p in self.selected_function.parameters
+                                  if p not in self.filled_params]
                 func_idx = self.param_key_indices[self.selected_function.name]
                 for param in remaining_keys:
                     tids = func_idx[param].get(fragment, [])
@@ -255,21 +259,21 @@ class ConstraintEngine:
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"AFTER_PARAM cache miss: key={already!r} not in pre-computed index. "
-                f"Keys present: {list(self.literal_indices[GenState.AFTER_PARAM])}"
-            )
+                f"AFTER_PARAM cache miss: key={already!r}",
+                "not in pre-computed index. Keys present:",
+                {list(self.literal_indices[GenState.AFTER_PARAM])})
 
         elif self.state == GenState.PARAM_VALUE:
             mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
             param_def = self.selected_function.parameters[self.current_param]
-            remaining_params = [p for p in self.selected_function.parameters if p not in self.filled_params]
+            remaining_params = [p for p in self.selected_function.parameters
+                                if p not in self.filled_params]
             more_params_follow = len(remaining_params) > 0
 
             if param_def.type == "string":
                 if not self.in_string_value:
                     mask[self.quote_tokens] = 0.0
                 else:
-                    # Apply strict Context-Aware Closers
                     mask[self.safe_string_content] = 0.0
                     if more_params_follow:
                         mask[self.safe_comma_closers] = 0.0
@@ -278,15 +282,14 @@ class ConstraintEngine:
 
             elif param_def.type == "number":
                 number_buffer = self.generated_so_far.split(": ")[-1]
-                valid_num_ids = self.numeric_constraint.get_valid_continuation_tokens(
-                    number_buffer, self._numeric_candidate_tokens
-                )
+                valid_num_ids = \
+                    self.numeric_constraint.get_valid_continuation_tokens(
+                        number_buffer, self._numeric_candidate_tokens)
                 mask[valid_num_ids] = 0.0
                 if more_params_follow:
                     mask[self.strict_comma_tokens] = 0.0
                 else:
                     mask[self.strict_brace_tokens] = 0.0
-
             return mask
 
         elif self.state == GenState.BETWEEN_PARAMS:
@@ -296,19 +299,17 @@ class ConstraintEngine:
                 if self.generated_so_far.endswith(target[:i]):
                     already = target[:i]
                     break
-
             if already == target:
                 mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
                 mask[self.quote_tokens] = 0.0
                 return mask
-
             cached = self.literal_indices[GenState.BETWEEN_PARAMS].get(already)
             if cached is not None:
                 return cached
             raise AssertionError(
-                f"BETWEEN_PARAMS cache miss: key={already!r} not in pre-computed index. "
-                f"Keys present: {list(self.literal_indices[GenState.BETWEEN_PARAMS])}"
-            )
+                f"BETWEEN_PARAMS cache miss: key={already!r} ",
+                "not in pre-computed index. Keys present:",
+                {list(self.literal_indices[GenState.BETWEEN_PARAMS])})
 
         elif self.state == GenState.CLOSING:
             mask = np.full(self.vocab_size, -1e9, dtype=np.float32)
@@ -318,14 +319,17 @@ class ConstraintEngine:
         return np.full(self.vocab_size, -1e9, dtype=np.float32)
 
     def update_state(self, token_id: int) -> None:
-        """Navigator: Recognizes transitions based on the token picked."""
+        """
+        Navigator: Recognizes transitions based on the token picked.
+        """
         token_str = self._token_clean_map.get(token_id, "")
         self.generated_so_far += token_str
 
         if self.state == GenState.FUNC_NAME:
             if token_str.endswith('"'):
                 name = self.generated_so_far.split('{"name": "')[-1][:-1]
-                self.selected_function = next(f for f in self.functions if f.name == name)
+                self.selected_function = next(
+                    f for f in self.functions if f.name == name)
                 self.state = GenState.AFTER_NAME
 
         elif self.state == GenState.AFTER_NAME:
@@ -361,7 +365,7 @@ class ConstraintEngine:
                     if not self.in_string_value:
                         self._transition_after_value()
 
-                        # BPE CATCH: Check if a closing brace sneaked in with the quote
+                        # BPE CATCH:Check if a closing brace sneaked in with the quote
                         if self.state == GenState.CLOSING and "}" in token_str:
                             after_quote = token_str.split('"')[-1]
                             braces = after_quote.count("}")
